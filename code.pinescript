@@ -1,1 +1,399 @@
-//New File to Edit
+//@version=6
+library("lib_gridHelper", overlay=true)
+
+//==============================================================================
+// SECTION 1: GRID SYSTEM TYPE DEFINITION
+//==============================================================================
+
+// Structure to store the grid configuration and state
+export type GridSystem
+    bool  isSet                        // Flag to indicate if grid is initialized
+    float gridSize                    // Size of each grid cell
+    float step                       // Effective grid step size with tick adjustment
+    int   grid_time_step            // Time step in current timeframe
+    float timeframeScaleFactor     //
+    float lowest                  // Lowest price reference
+    float highest                // Highest price reference
+    float atr_localTf           // ATR value for reference updated on bar 
+    float atr_daily            //
+    int   initBars            //bars in local timeframe needed to initialise
+    int   initDays           //convert initBars to trading days
+    int   resetTime         //Reset timestamp : this is not used
+    int   miliSecsUsed     // miliSeconds in period
+    int   bars_per_day    // Bars per day in current timeframe (when timeframe < Daily)
+    int   version        //Incremented every time grid parameters change
+    bool  debugMode     //turn on debug logs
+    
+    line[] horizontalLines
+    line[] verticalLines
+    label[] gridLabels
+
+//==============================================================================
+// SECTION 2: INITIALIZATION FUNCTIONS
+//==============================================================================
+const int MAX_BARS_ALLOWED = 95000 //Pine has a limit of 100 000 Bars
+const int MS_IN_TRADING_DAY = 8 * 60 * 60 * 1000
+const int MS_IN_WEEK   = 7 * MS_IN_TRADING_DAY
+const int MS_IN_MONTH  = math.ceil(30.44 * MS_IN_TRADING_DAY)  // Approximate average
+const int MS_IN_DAY = 24 * 60 * 60 * 1000
+//
+var int decimals = str.length(str.tostring(syminfo.mintick))-2
+//
+// Helper routine to delete line objects contained in an array
+removeLines(array<line> lines) =>
+    for l in lines
+        line.delete(l)
+    array.clear(lines)
+
+// Helper routine to delete label objects contained in an array
+removeLabels(array<label> labels) =>
+    for lb in labels
+        label.delete(lb)
+    array.clear(labels)
+
+// Determine how many milliseconds to use based on symbol type and timeframe
+miliSecsToUse() => 
+    var int miliSecsToUse = na
+    if timeframe.ismonthly
+        miliSecsToUse := MS_IN_MONTH
+    else if timeframe.isweekly 
+        miliSecsToUse := MS_IN_WEEK
+    else
+        if  syminfo.type == "forex"
+            miliSecsToUse := MS_IN_TRADING_DAY
+        else
+            miliSecsToUse := MS_IN_DAY
+    miliSecsToUse
+
+print(m) => str.tostring(m)+"\n"
+
+export getBarTimeStep() =>
+    //The number of miliseconds between bars
+    int _barTimeStep = na
+    if bar_index < 6
+        _barTimeStep
+    else
+        if na(_barTimeStep)
+            int step = nz(time - time[1])
+            int step1 = nz(time[1] - time[2])
+            int step2 = nz(time[2] - time[3])
+            int step3 = nz(time[3] - time[4])
+            int step4 = nz(time[4] - time[5])
+            _barTimeStep := math.min(step, step1, step2, step3, step4)
+    _barTimeStep
+
+export bars_per_day() => not na(getBarTimeStep()) and getBarTimeStep() > 0 ? math.round(miliSecsToUse() / getBarTimeStep()) : na
+
+export bars_available_inCurr_timeFrame(float pct_bars_required_to_elapse = 0.5) => 
+
+    var int barsAvailableForUse = na
+    //Total number of bars in the current timeframe for the symbol
+    totalBarsAvailable = last_bar_index + 1
+    barsAvailableForUse := math.min(MAX_BARS_ALLOWED, math.floor(totalBarsAvailable * pct_bars_required_to_elapse))
+    barsAvailableForUse
+//
+export getTimeScaleFactor()=>
+    // Add timeframe scaling - similar concept to what's already in calculateGridResetTimestamp
+    int tfMinutes = timeframe.in_seconds()/60
+    float timeframeScaleFactor = 1.0
+    
+    // Set scaling factors based on a proportional relationship to daily
+    if tfMinutes <= 1  // 1-minute (1/1440 of a day)
+        timeframeScaleFactor := 0.05
+    else if tfMinutes <= 5  // 5-minute (1/288 of a day)
+        timeframeScaleFactor := 0.08  // <-- This specifically addresses your 5-min issue
+    else if tfMinutes <= 15  // 15-minute (1/96 of a day)
+        timeframeScaleFactor := 0.15
+    else if tfMinutes <= 60  // Hourly (1/24 of a day)
+        timeframeScaleFactor := 0.25
+    else if tfMinutes <= 240  // 4-hour (1/6 of a day)
+        timeframeScaleFactor := 0.5
+    // Daily and above use the default factor of 1.0
+    timeframeScaleFactor
+
+export getScaleFactor(float dailyATR, float localATR)=>
+    float scaleFactor = getTimeScaleFactor()
+    if not na(dailyATR) and not na(localATR)
+        pct = localATR/dailyATR
+        scaleFactor := math.round(pct,2)
+    scaleFactor
+//
+
+//
+//
+export convertNumberBars_lowerTF_toNumberDays(int _barTimeStep, int numBarsinLowerTimeframe) =>
+    var int adjustedDaysAvailable = 1
+
+    if na(_barTimeStep) or na(numBarsinLowerTimeframe) or timeframe.ismonthly or timeframe.isweekly
+        adjustedDaysAvailable
+    else
+        //The User doesnt have enough bars to initialise we need to adjust it
+        //20% of the availble bars must elapse before we set the gridSystem        
+        adjustedDaysAvailable := math.floor(numBarsinLowerTimeframe / bars_per_day())
+
+    adjustedDaysAvailable
+//
+//
+// Calculates the timestamp for grid reset based on timeframe
+export calculateGridResetTimestamp(int thresholdDays = 1000) =>
+
+    var int resetTimestamp = na
+    if timeframe.isdaily or timeframe.isweekly or timeframe.isweekly
+        resetTimestamp
+
+    // Get current timeframe in minutes
+    // int tfMinutes = timeframe.in_seconds()/60
+    // int days = lookbackDays
+    
+    // // Adjust lookback days based on timeframe
+    // if tfMinutes == 1  // 1-minute
+    //     days := 50
+    // else if tfMinutes <= 5  // 5-minute
+    //     days := 100
+    // else if tfMinutes <= 15  // 15-minute
+    //     days := 600
+    // else if tfMinutes <= 60  // Hourly
+    //     days := 1000
+    // else if tfMinutes <= 240  // 4-hour
+    //     days := 2000
+    // else  // Daily, Weekly or higher
+    //     days := 3000
+    else
+        // Calculate timestamp with 9:30 as reference time
+        int yearCTD = year(timenow)
+        int monthCTD = month(timenow)
+        int dayCTD = dayofmonth(timenow)
+        resetTimestamp := timestamp(yearCTD, monthCTD, dayCTD, 9, 30) - (thresholdDays * 86400 * 1000)
+
+    resetTimestamp
+
+
+//
+//
+export initaliseGrid(float pct_bars_required_to_elapse = 0.5, float dailyATR, float localATR, bool debugModeOn = false)=>
+
+    var GridSystem this = na
+    
+    int required_bars_to_set_grid = bars_available_inCurr_timeFrame(pct_bars_required_to_elapse)
+
+    var int trading_periods = na
+    int barStep = getBarTimeStep()
+
+    if not na(barStep) 
+        //when barStep > MS_IN_DAY (monthly or weekly we default to 30 since the function returns 1)
+        trading_periods := math.max(convertNumberBars_lowerTF_toNumberDays(barStep, required_bars_to_set_grid),30)
+
+    float ll =  ta.lowest(low, required_bars_to_set_grid) 
+    float hh = ta.highest(high, required_bars_to_set_grid)
+
+
+    waitIsOver = bar_index > required_bars_to_set_grid + 1
+
+    if not waitIsOver
+        if debugModeOn
+            log.info("TD: "+print(trading_periods) + " bstep "+ print(barStep)+ " barsNeededForValidation "+print(required_bars_to_set_grid - bar_index) )
+
+        this
+
+    else
+
+        float tsF = getScaleFactor(dailyATR, localATR)
+
+        if na(barStep) or na(tsF)
+            this
+
+        else
+        
+            var float computedGridSize = 0
+            computedGridSize := dailyATR * (tsF)
+
+            this := GridSystem.new(
+                                         isSet = true                                           // Flag to indicate if gridSystem is initialized
+                                         ,gridSize = math.round(computedGridSize, decimals)                           // Size of each gridSystem cell
+                                         ,step    = math.round(computedGridSize + syminfo.mintick,decimals)          // Effective gridSystem step size with tick adjustment
+                                         ,timeframeScaleFactor = tsF
+                                         ,grid_time_step = barStep                              // Timestep of current timeframe
+                                         ,lowest  =     ll                                      // Lowest price reference
+                                         ,highest =     hh                                      // Highest price reference
+                                         ,atr_localTf = localATR                                // ATR value for reference
+                                         ,atr_daily = dailyATR
+                                         ,initBars = required_bars_to_set_grid
+                                         ,initDays = trading_periods
+                                         ,resetTime = calculateGridResetTimestamp(trading_periods)
+                                         ,miliSecsUsed  = miliSecsToUse()                       // miliSeconds in period
+                                         ,bars_per_day  = bars_per_day()                        // Bars per day in current timeframe (when timeframe < Daily)
+                                         ,version = 1  
+                                         ,debugMode = debugModeOn 
+                                         ,horizontalLines = array.new_line()
+                                         ,verticalLines =  array.new_line()
+                                         ,gridLabels =  array.new_label()
+                                         )
+
+            if debugModeOn
+                log.info(
+                           "🔧 Grid Initialisation Details: "
+                         + "• required_bars_to_set_grid: " + print(required_bars_to_set_grid)
+                         + "• dailyATR: " + print(dailyATR)
+                         + "• localATR: " + print(localATR)
+                         + "• computedGridSize: " + print(computedGridSize)
+                         + "• step: " + print(this.step)
+                         + "• tsF (timeframeScaleFactor): " + print(tsF)
+                         + "• grid_time_step: " + print(this.grid_time_step)
+                         +  "• lowest: " + print(ll)
+                         + "• highest: " + print(hh)
+                         + "• atr_localTf: " + print(this.atr_localTf)
+                         + "• atr_daily: " + print(this.atr_daily)
+                         + "• initBars: " + print(this.initBars)
+                         + "• initDays: " + print(trading_periods)
+                         + "• resetTime: " + print(this.resetTime)
+                         + "• version: " + print(this.version)
+                         + "• currBarIndex: " + print(bar_index)
+                         )
+    
+            if barstate.islast and na(this)
+                log.error("Grid Failed to initialise")
+
+            if not na(this) 
+                log.info("Grid Initialised on Bar "+ print(bar_index) + "isGridSet: "+ print(this.isSet))
+
+
+            this
+
+
+//==============================================================================
+// SECTION 3: GRID CALCULATION METHODS
+//==============================================================================
+
+// Gets the grid ID for a given price
+export method getGridID(GridSystem this, float price) =>
+    price < this.gridSize ? 1 : math.floor((price - this.gridSize) / this.step) + 2
+
+// Gets the lower and upper bounds of a grid given its ID
+export method getGridBounds(GridSystem this, int id) =>
+    float lowerBound = id == 1 ? 0 : (this.gridSize + syminfo.mintick) * (id - 1)
+    float upperBound = lowerBound + this.gridSize
+    [lowerBound, upperBound]
+
+// Gets the mid-price of a grid given its ID
+export method getGridMidPrice(GridSystem this, int id) => 
+    [lowerBound, upperBound] = this.getGridBounds(id)
+    (lowerBound + upperBound) / 2
+
+// Helper function to calculate a dynamic threshold from ATR
+export getThresholdFromATR(float dailyATR, float gridSize, float gridStep) =>
+    math.max(math.ceil(dailyATR / gridSize), math.ceil(dailyATR / gridStep))
+
+//==============================================================================
+// SECTION 4: GRID VISUALIZATION
+//==============================================================================
+
+// Draws the grid on the chart, including both horizontal and vertical lines
+// Returns [horizontalLines, verticalLines, gridLabels]
+export method drawGrid(GridSystem this, int startBarIndex, int endBarIndex, float lowerPriceLimit, float upperPriceLimit, int gridInterval = 10, bool debugOn = false) =>
+    if not this.isSet
+        [array.new_line(), array.new_line(), array.new_label()]
+    else
+        // Get grid IDs for these actual price extremes
+        int lowerGridID = this.getGridID(lowerPriceLimit)
+        int upperGridID = this.getGridID(upperPriceLimit)
+        
+        // Create grid range with reasonable limits
+        // Always include grid ID 1 (which starts at 0) to ensure we go to the bottom
+        int gridID_low = math.max(1, lowerGridID - 5)
+        int gridID_high = upperGridID + 5
+        
+        // Calculate the middle grid ID between low and high
+        int gridID_middle = math.floor((gridID_low + gridID_high) / 2)
+
+        // Create arrays to hold grid objects
+        //var line[] horizontalLines = array.new_line()
+        //var line[] verticalLines = array.new_line()
+        //var label[] gridLabels = array.new_label()
+        // Clear existing objects before redrawing
+        
+        
+        
+        // Clear previous grid lines
+        removeLines(this.horizontalLines)
+
+        // if array.size(this.horizontalLines) > 0
+        //     for i = 0 to array.size(this.horizontalLines) - 1
+        //         line.delete(array.get(this.horizontalLines, i))
+        //     array.clear(this.horizontalLines)
+        
+        removeLines(this.verticalLines)
+        // if array.size(this.verticalLines) > 0
+        //     for i = 0 to array.size(this.verticalLines) - 1
+        //         line.delete(array.get(this.verticalLines, i))
+        //     array.clear(this.verticalLines)
+
+        // // Clear previous labels
+        removeLabels(this.gridLabels)
+        // if array.size(this.gridLabels) > 0
+        //     for i = 0 to array.size(this.gridLabels) - 1
+        //         label.delete(array.get(this.gridLabels, i))
+        //     array.clear(this.gridLabels)
+        
+        // Get absolute boundaries for the entire grid range
+        [lowestBound, _] = this.getGridBounds(gridID_low)
+        [_, highestBound] = this.getGridBounds(gridID_high)
+        
+        // Create horizontal grid lines and labels
+        for id = gridID_low to gridID_high
+            [lb, ub] = this.getGridBounds(id)
+
+            // Add lower bound grid line
+            lbLine = line.new(
+                     x1=startBarIndex, y1=lb, x2=endBarIndex, y2=lb, 
+                     color=color.new(color.blue, 70), style=line.style_dashed, width=2, 
+                     extend=extend.both, xloc=xloc.bar_index)
+            if debugOn
+                log.info("Print (lBound) hline at grid = " + print(lb) )
+            array.push(this.horizontalLines, lbLine)
+            
+
+            // Upper bound line
+            ubLine = line.new(
+                     x1=startBarIndex, y1=ub, x2=endBarIndex, y2=ub, 
+                     color=color.new(color.blue, 70), style=line.style_dotted, width=1, 
+                     extend=extend.both, xloc=xloc.bar_index)
+            if debugOn
+                log.info("Print (ubound) hline at grid = " + print(ub) )
+            array.push(this.horizontalLines, ubLine)
+
+
+            // Add label for key grid lines
+            if id == gridID_low or id == gridID_high or id  == gridID_middle // Calculate the middle grid ID between low and high
+
+                lbl = label.new(
+                     x=endBarIndex, 
+                     y=lb, 
+                     text="Grid " + str.tostring(id), 
+                     color=color.new(color.blue, 70),
+                     style=label.style_label_right,
+                     textcolor=color.white)
+                array.push(this.gridLabels, lbl)
+            
+        
+        // Create vertical grid lines
+        for i = startBarIndex to endBarIndex by gridInterval
+            vLine = line.new(
+                     x1=i, y1=lowestBound, x2=i, y2=highestBound, 
+                     color=color.new(color.red, 50), style=line.style_dotted, width=2, 
+                     extend=extend.none, xloc=xloc.bar_index)
+            array.push(this.verticalLines, vLine)
+        
+        // Return the arrays of created objects
+        [this.horizontalLines, this.verticalLines, this.gridLabels]
+
+//==============================================================================
+// SECTION 5: ADDITIONAL UTILITY FUNCTIONS
+//==============================================================================
+
+// Function to determine if we need to initialize or reset grid
+export shouldInitializeGrid(GridSystem this, int gridResetTimestamp) =>
+    shouldInitializeGrid = false
+    if time >= gridResetTimestamp and time[1] < gridResetTimestamp
+        this.version  := this.version + 1
+        shouldInitializeGrid := true
+    shouldInitializeGrid
